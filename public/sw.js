@@ -146,8 +146,8 @@ self.addEventListener("fetch", (event) => {
                 }
             }
 
-            // Check if Scramjet should route this request
-            if (scramjet.route(event)) {
+            // Check if Scramjet should route this request (only when config is loaded)
+            if (scramjet.config && scramjet.route(event)) {
                 try {
                     return await scramjet.fetch(event);
                 } catch (fetchErr) {
