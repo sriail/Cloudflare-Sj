@@ -39,18 +39,104 @@ try {
     console.error('Failed to load BareMux scripts:', err);
 }
 
-// Initialize Scramjet service worker instance only if available
-let scramjet = null;
-if (ScramjetServiceWorker) {
-    try {
-        scramjet = new ScramjetServiceWorker({
-            prefix: '/sj-core/',
-        });
-    } catch (err) {
-        console.error('Failed to initialize ScramjetServiceWorker:', err);
-    }
+// =====================================================================
+// INDEXEDDB SCHEMA SETUP
+// =====================================================================
+
+/**
+ * Ensure the "$scramjet" IndexedDB database has all required object stores.
+ *
+ * ScramjetServiceWorker opens this database in its constructor and in
+ * loadConfig() but does NOT provide an onupgradeneeded handler.  On a
+ * fresh install that means the database is created empty, causing every
+ * subsequent objectStore() call to throw NotFoundError inside an async
+ * callback whose Promise is never resolved or rejected — freezing every
+ * fetch event indefinitely.
+ *
+ * We open the database here with an onupgradeneeded handler so the
+ * stores exist before Scramjet ever touches the database.  If the
+ * database was previously created empty (version 1, no stores) we
+ * delete and recreate it because IDB versioning prevents adding stores
+ * without a version bump once the database already exists at version 1.
+ */
+function ensureIDBSchema() {
+    const REQUIRED_STORES = [
+        'config', 'cookies', 'redirectTrackers',
+        'referrerPolicies', 'publicSuffixList',
+    ];
+
+    return new Promise((resolve) => {
+        const req = indexedDB.open('$scramjet', 1);
+
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            REQUIRED_STORES.forEach(store => {
+                if (!db.objectStoreNames.contains(store)) {
+                    db.createObjectStore(store);
+                }
+            });
+        };
+
+        req.onsuccess = () => {
+            const db = req.result;
+            const missing = REQUIRED_STORES.filter(
+                s => !db.objectStoreNames.contains(s)
+            );
+            db.close();
+
+            if (missing.length === 0) {
+                resolve();
+                return;
+            }
+
+            // Database is at version 1 but is missing stores (it was created
+            // by an earlier open call that had no onupgradeneeded handler).
+            // Delete it so we can recreate it with all required stores.
+            const delReq = indexedDB.deleteDatabase('$scramjet');
+            delReq.onsuccess = delReq.onerror = () => {
+                const newReq = indexedDB.open('$scramjet', 1);
+                newReq.onupgradeneeded = () => {
+                    const newDb = newReq.result;
+                    REQUIRED_STORES.forEach(s => newDb.createObjectStore(s));
+                };
+                newReq.onsuccess = () => { newReq.result.close(); resolve(); };
+                newReq.onerror = () => resolve();
+            };
+        };
+
+        req.onerror = () => resolve(); // Don't block on unexpected IDB errors
+    });
 }
 
+// =====================================================================
+// LAZY SCRAMJET INITIALIZATION
+// =====================================================================
+
+/**
+ * ScramjetServiceWorker is constructed lazily, after the IDB schema is
+ * guaranteed to exist.  A single Promise is used so construction happens
+ * exactly once regardless of how many concurrent fetch events trigger it.
+ */
+let scramjet = null;
+let scramjetInitPromise = null;
+
+function initScramjet() {
+    if (scramjetInitPromise) return scramjetInitPromise;
+
+    scramjetInitPromise = ensureIDBSchema().then(() => {
+        if (!ScramjetServiceWorker) return;
+        try {
+            scramjet = new ScramjetServiceWorker();
+            setupScramjetRequestHandler();
+        } catch (err) {
+            console.error('Failed to initialize ScramjetServiceWorker:', err);
+        }
+    }).catch(err => {
+        console.error('Scramjet init failed:', err);
+    });
+
+    return scramjetInitPromise;
+}
 
 // =====================================================================
 // SERVICE WORKER LIFECYCLE
@@ -61,7 +147,11 @@ self.addEventListener('install', () => {
 });
 
 self.addEventListener('activate', (event) => {
-    event.waitUntil(self.clients.claim());
+    // Wait for Scramjet (and IDB schema) to be ready before claiming clients
+    // so that the first fetch event is never handled with an uninitialised SW.
+    event.waitUntil(
+        initScramjet().then(() => self.clients.claim())
+    );
 });
 
 // =====================================================================
@@ -125,29 +215,23 @@ self.addEventListener("message", ({ data }) => {
 // PROXY ROUTING
 // =====================================================================
 
-// Load scramjet config once to avoid repeated IndexedDB transaction races.
-let scramjetConfigLoaded = false;
-
 // Main fetch handler - routes through Scramjet
 self.addEventListener("fetch", (event) => {
     event.respondWith((async () => {
+        // Ensure Scramjet is initialised (IDB schema ready + instance created).
+        // initScramjet() resolves immediately after the first successful call.
+        await initScramjet();
+
         // If Scramjet is not available, pass through to network
         if (!scramjet) {
             return fetch(event.request);
         }
 
         try {
-            if (!scramjetConfigLoaded) {
-                try {
-                    await scramjet.loadConfig();
-                    scramjetConfigLoaded = true;
-                } catch (configErr) {
-                    console.error('Scramjet loadConfig error (likely IndexedDB):', configErr);
-                }
-            }
-
-            // Check if Scramjet should route this request (config is undefined until
-            // loadConfig() reads it from IDB; skip routing until it's available)
+            // scramjet.config is set via the {scramjet$type:"loadConfig"} postMessage
+            // that ScramjetController.init() sends after writing config to IDB.
+            // We never call scramjet.loadConfig() directly because its Promise
+            // hangs forever when the IDB "config" store is empty (no config written yet).
             if (scramjet.config && scramjet.route(event)) {
                 try {
                     return await scramjet.fetch(event);
@@ -169,8 +253,8 @@ self.addEventListener("fetch", (event) => {
 // SCRAMJET REQUEST HANDLER
 // =====================================================================
 
-// The main Scramjet listener where the proxying logic happens
-if (scramjet) {
+// Called once from initScramjet() after the instance is created.
+function setupScramjetRequestHandler() {
     scramjet.addEventListener("request", async (e) => {
         e.response = (async () => {
             try {
