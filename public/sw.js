@@ -146,7 +146,8 @@ self.addEventListener("fetch", (event) => {
                 }
             }
 
-            // Check if Scramjet should route this request (only when config is loaded)
+            // Check if Scramjet should route this request (config is undefined until
+            // loadConfig() reads it from IDB; skip routing until it's available)
             if (scramjet.config && scramjet.route(event)) {
                 try {
                     return await scramjet.fetch(event);

@@ -354,7 +354,7 @@
           scramjet = new ScramjetController({
             prefix: '/scramjet/',
             files: {
-              wasm: '/sj-core/scramjet.wasm.wasm',
+              wasm: '/sj-core/scramjet.wasm.wasm', // double .wasm extension is intentional (Scramjet naming convention)
               sync: '/sj-core/scramjet.sync.js',
               all: '/sj-core/scramjet.all.js',
             }
